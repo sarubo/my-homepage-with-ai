@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenAPI</title>
+  <link rel="stylesheet" href="/css/site.css">
+</head>
+<body>
+  <nav><a href="/">ページ一覧</a><a href="/app/hello_world/">hello_world</a><a href="/app/fileshare/">fileshare</a><a href="/docs/">OpenAPI</a></nav>
+  <h1>OpenAPI</h1>
+  <p><a href="/openapi/v1.json">OpenAPI 3.0 JSON を開く</a></p>
+  <section class="panel">
+    <h2>エンドポイント</h2>
+    <ul>
+      <li><code>GET /api/files</code> — ファイル一覧を取得</li>
+      <li><code>POST /api/files</code> — <code>multipart/form-data</code> で複数ファイルをアップロード</li>
+      <li><code>DELETE /api/files</code> — JSON の <code>{"ids":["UUID", ...]}</code> で選択削除</li>
+      <li><code>GET /api/files/{id}/download</code> — 個別ダウンロード</li>
+    </ul>
+  </section>
+  <p>このページとJSONドキュメントは外部CDNに依存しない、Swagger UI 相当のAPI参照です。</p>
+</body>
+</html>

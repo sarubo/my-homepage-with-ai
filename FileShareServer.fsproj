@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <DebugType>embedded</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Storage.fs" />
+    <Compile Include="Program.fs" />
+    <Content Update="global.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <Content Remove="wwwroot/**" />
+    <None Remove="wwwroot/**" />
+    <EmbeddedResource Include="wwwroot/**" />
+  </ItemGroup>
+</Project>
