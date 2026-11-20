@@ -3,7 +3,9 @@ namespace FileShare
 open System
 open System.Collections.Generic
 open System.IO
+open System.IO.Pipelines
 open System.Threading
+open System.Threading.Channels
 open System.Threading.Tasks
 
 [<CLIMutable>]
@@ -19,16 +21,154 @@ type DeleteResponse = { Deleted: int }
 [<CLIMutable>]
 type DeleteRequest = { Ids: Guid array }
 
-type FileDownload =
-    { Name: string
-      SizeBytes: int64
-      OpenRead: unit -> Stream }
+type StoreError =
+    | Busy
+    | TooLarge
 
-type IFileStore =
-    abstract List: unit -> StoredFileInfo list
-    abstract TryOpen: id: Guid -> FileDownload option
-    abstract SaveAsync: fileName: string * content: Stream * cancellationToken: CancellationToken -> Task<StoredFileInfo>
-    abstract DeleteMany: ids: Guid array -> int
+type private ChunkedContent =
+    { Chunks: byte array array
+      Length: int64 }
+
+type private StoredFile =
+    { Info: StoredFileInfo
+      Content: ChunkedContent }
+
+type FileDownload = private { Name: string; SizeBytes: int64; Content: ChunkedContent }
+
+module FileDownload =
+    let private copyToPipe (content: ChunkedContent) (writer: PipeWriter) (cancellationToken: CancellationToken) =
+        task {
+            try
+                let mutable writing = true
+                let mutable chunkIndex = 0
+
+                while writing && chunkIndex < content.Chunks.Length do
+                    cancellationToken.ThrowIfCancellationRequested()
+                    let! flushResult = writer.WriteAsync(content.Chunks.[chunkIndex].AsMemory(), cancellationToken)
+
+                    if flushResult.IsCanceled then
+                        cancellationToken.ThrowIfCancellationRequested()
+                        raise (OperationCanceledException())
+
+                    writing <- not flushResult.IsCompleted
+                    chunkIndex <- chunkIndex + 1
+
+                do! writer.CompleteAsync()
+            with error ->
+                try
+                    do! writer.CompleteAsync(error)
+                with _ -> ()
+        }
+
+    /// Creates a Stream adapter over a bounded pipeline. The producer task owns
+    /// the PipeWriter; disposing the returned stream completes the PipeReader.
+    let toStream (file: FileDownload) (cancellationToken: CancellationToken) : Stream =
+        let pipe =
+            new Pipe(
+                PipeOptions(
+                    pauseWriterThreshold = 1024L * 1024L,
+                    resumeWriterThreshold = 512L * 1024L,
+                    useSynchronizationContext = false
+                )
+            )
+
+        // The copy routine captures and reports its own errors to the reader by
+        // completing the writer with the exception, so this task does not fault.
+        copyToPipe file.Content pipe.Writer cancellationToken |> ignore
+        pipe.Reader.AsStream()
+
+type private State =
+    { Files: Map<string, StoredFile>
+      UsedBytes: int64
+      ReservedBytes: int64
+      Reservations: Map<Guid, int64> }
+
+module private State =
+    let empty =
+        { Files = Map.empty
+          UsedBytes = 0L
+          ReservedBytes = 0L
+          Reservations = Map.empty }
+
+    let list state =
+        state.Files
+        |> Map.toSeq
+        |> Seq.map (fun (_, file) -> file.Info)
+        |> Seq.sortBy (fun file -> file.Name)
+        |> Seq.toList
+
+    let tryOpen id state =
+        state.Files
+        |> Map.toSeq
+        |> Seq.tryPick (fun (_, file) ->
+            if file.Info.Id = id then
+                Some
+                    { Name = file.Info.Name
+                      SizeBytes = file.Info.SizeBytes
+                      Content = file.Content }
+            else
+                None)
+
+    let reserve uploadId requestedBytes state =
+        let available = max 0L (4L * 1024L * 1024L * 1024L - state.UsedBytes - state.ReservedBytes)
+        let granted = min requestedBytes available
+
+        if granted <= 0L then
+            state, 0L
+        else
+            let previous = state.Reservations |> Map.tryFind uploadId |> Option.defaultValue 0L
+
+            { state with
+                ReservedBytes = state.ReservedBytes + granted
+                Reservations = Map.add uploadId (previous + granted) state.Reservations },
+            granted
+
+    let release uploadId bytes state =
+        let previous = state.Reservations |> Map.tryFind uploadId |> Option.defaultValue 0L
+        let released = min previous (max 0L bytes)
+        let remaining = previous - released
+
+        { state with
+            ReservedBytes = max 0L (state.ReservedBytes - released)
+            Reservations =
+                if remaining = 0L then Map.remove uploadId state.Reservations
+                else Map.add uploadId remaining state.Reservations }
+
+    let commit uploadId file state =
+        let reserved = state.Reservations |> Map.tryFind uploadId |> Option.defaultValue 0L
+        let previousSize =
+            state.Files
+            |> Map.tryFind file.Info.Name
+            |> Option.map (fun previous -> previous.Content.Length)
+            |> Option.defaultValue 0L
+
+        { state with
+            Files = Map.add file.Info.Name file state.Files
+            UsedBytes = state.UsedBytes - previousSize + file.Content.Length
+            ReservedBytes = max 0L (state.ReservedBytes - reserved)
+            Reservations = Map.remove uploadId state.Reservations }
+
+    let deleteMany (ids: Guid array) (state: State) =
+        if isNull ids then
+            state, 0
+        else
+            let selected = HashSet<Guid>(ids)
+
+            let remaining =
+                state.Files
+                |> Map.filter (fun _ file -> not (selected.Contains(file.Info.Id)))
+
+            let deleted = state.Files.Count - remaining.Count
+
+            let usedBytes =
+                remaining
+                |> Map.toSeq
+                |> Seq.sumBy (fun (_, file) -> file.Content.Length)
+
+            { state with
+                Files = remaining
+                UsedBytes = usedBytes },
+            deleted
 
 module FileName =
     let tryNormalize (fileName: string) =
@@ -46,243 +186,223 @@ module FileName =
             else
                 Ok name
 
-type private ChunkedContent =
-    { Chunks: byte array array
-      Length: int64 }
+module FileStore =
+    let private ChunkSize = 4 * 1024 * 1024
+    let private MaxFileSize = 4L * 1024L * 1024L * 1024L
 
-type private StoredFile =
-    { Info: StoredFileInfo
-      Content: ChunkedContent }
+    type private Message =
+        | List of TaskCompletionSource<Result<StoredFileInfo list, StoreError>>
+        | TryOpen of Guid * TaskCompletionSource<Result<FileDownload option, StoreError>>
+        | Reserve of Guid * int64 * TaskCompletionSource<Result<int64, StoreError>>
+        | Release of Guid * int64 * TaskCompletionSource<unit>
+        | Commit of Guid * StoredFile * TaskCompletionSource<Result<StoredFileInfo, StoreError>>
+        | DeleteMany of Guid array * TaskCompletionSource<Result<int, StoreError>>
 
-/// Read-only stream over fixed-size memory chunks.  A chunk is intentionally much
-/// smaller than the CLR array-size limit, so a single 4 GiB upload is supported.
-type private ChunkedReadStream(chunks: byte array array, length: int64, chunkSize: int) =
-    inherit Stream()
+    type Handle = private { Channel: Channel<Message> }
 
-    let mutable position = 0L
+    let private newReply<'T> () =
+        TaskCompletionSource<'T>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-    member private _.ReadCore(destination: Span<byte>) =
-        if position >= length || destination.Length = 0 then
-            0
-        else
-            let available = min (int64 destination.Length) (length - position)
-            let mutable copied = 0
-            let mutable remaining = int available
+    let createHandle () =
+        let options =
+            BoundedChannelOptions(127,
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait)
 
-            while remaining > 0 do
-                let chunkIndex = int (position / int64 chunkSize)
-                let chunkOffset = int (position % int64 chunkSize)
-                let fromChunk = min remaining (chunks.[chunkIndex].Length - chunkOffset)
+        { Channel = Channel.CreateBounded<Message>(options) }
 
-                chunks.[chunkIndex].AsSpan(chunkOffset, fromChunk).CopyTo(destination.Slice(copied, fromChunk))
+    let start (handle: Handle) =
+        let rec run state =
+            task {
+                let! message = handle.Channel.Reader.ReadAsync()
 
-                position <- position + int64 fromChunk
-                copied <- copied + fromChunk
-                remaining <- remaining - fromChunk
+                match message with
+                | List reply ->
+                    reply.TrySetResult(Ok(State.list state)) |> ignore
+                    return! run state
+                | TryOpen (id, reply) ->
+                    reply.TrySetResult(Ok(State.tryOpen id state)) |> ignore
+                    return! run state
+                | Reserve (uploadId, requested, reply) ->
+                    let nextState, granted = State.reserve uploadId requested state
+                    reply.TrySetResult(Ok granted) |> ignore
+                    return! run nextState
+                | Release (uploadId, bytes, reply) ->
+                    let nextState = State.release uploadId bytes state
+                    reply.TrySetResult(()) |> ignore
+                    return! run nextState
+                | Commit (uploadId, stored, reply) ->
+                    let nextState = State.commit uploadId stored state
+                    reply.TrySetResult(Ok stored.Info) |> ignore
+                    return! run nextState
+                | DeleteMany (ids, reply) ->
+                    let nextState, deleted = State.deleteMany ids state
+                    reply.TrySetResult(Ok deleted) |> ignore
+                    return! run nextState
+            }
 
-            copied
+        run State.empty
 
-    override _.CanRead = true
-    override _.CanSeek = true
-    override _.CanWrite = false
-    override _.Length = length
+    let private ask (handle: Handle) tryWrite createMessage =
+            task {
+                let reply = newReply ()
+                let message = createMessage reply
 
-    override _.Position
-        with get () = position
-        and set value =
-            if value < 0L || value > length then
-                raise (ArgumentOutOfRangeException(nameof value))
+                if not (tryWrite message) then
+                    return Error Busy
+                else
+                    return! reply.Task
+            }
 
-            position <- value
+    let private askRequired (handle: Handle) (cancellationToken: CancellationToken) createMessage =
+            task {
+                let reply = newReply ()
+                do! handle.Channel.Writer.WriteAsync(createMessage reply, cancellationToken)
+                return! reply.Task
+            }
 
-    override _.Flush() = ()
+    let private reserve (handle: Handle) uploadId requested =
+        ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) (fun reply -> Reserve(uploadId, requested, reply))
 
-    override this.Read(buffer: byte array, offset: int, count: int) =
-        if isNull buffer then
-            nullArg (nameof buffer)
+    let private release (handle: Handle) uploadId bytes =
+        askRequired handle CancellationToken.None (fun reply -> Release(uploadId, bytes, reply))
 
-        if offset < 0 || count < 0 || offset > buffer.Length - count then
-            raise (ArgumentOutOfRangeException())
+    let private saveCoreAsync (handle: Handle) (fileName: string) (reader: PipeReader) (cancellationToken: CancellationToken) =
+            let work = task {
+                let uploadId = Guid.NewGuid()
+                let chunks = ResizeArray<byte array>()
+                let mutable uploadedBytes = 0L
+                let mutable reservedBytes = 0L
+                let mutable finished = false
+                let mutable result: Result<StoredFileInfo, StoreError> option = None
 
-        this.ReadCore(buffer.AsSpan(offset, count))
+                try
+                    while not finished && result.IsNone do
+                        cancellationToken.ThrowIfCancellationRequested()
 
-    override this.ReadAsync(buffer: Memory<byte>, cancellationToken: CancellationToken) =
-        cancellationToken.ThrowIfCancellationRequested()
-        ValueTask<int>(this.ReadCore(buffer.Span))
+                        if uploadedBytes = MaxFileSize then
+                            let! probe = reader.ReadAsync(cancellationToken)
 
-    override _.Seek(offset: int64, origin: SeekOrigin) =
-        let newPosition =
-            match origin with
-            | SeekOrigin.Begin -> offset
-            | SeekOrigin.Current -> position + offset
-            | SeekOrigin.End -> length + offset
-            | _ -> raise (ArgumentOutOfRangeException(nameof origin))
+                            if probe.Buffer.IsEmpty && probe.IsCompleted then
+                                reader.AdvanceTo(probe.Buffer.End)
+                                finished <- true
+                            elif probe.Buffer.IsEmpty then
+                                reader.AdvanceTo(probe.Buffer.Start, probe.Buffer.End)
+                            else
+                                let consumed = probe.Buffer.GetPosition(1L)
+                                reader.AdvanceTo(consumed)
+                                result <- Some(Error TooLarge)
+                        else
+                            let requested = min (int64 ChunkSize) (MaxFileSize - uploadedBytes)
+                            let! reservation = reserve handle uploadId requested
 
-        if newPosition < 0L || newPosition > length then
-            raise (IOException("指定された位置はファイル範囲外です。"))
+                            match reservation with
+                            | Error error -> result <- Some(Error error)
+                            | Ok granted when granted = 0L ->
+                                // Capacity may be exactly exhausted by this upload. Read one
+                                // byte to distinguish an exact-limit file from an oversized one.
+                                let! probe = reader.ReadAsync(cancellationToken)
 
-        position <- newPosition
-        position
+                                if probe.Buffer.IsEmpty && probe.IsCompleted then
+                                    reader.AdvanceTo(probe.Buffer.End)
+                                    finished <- true
+                                elif probe.Buffer.IsEmpty then
+                                    reader.AdvanceTo(probe.Buffer.Start, probe.Buffer.End)
+                                else
+                                    let consumed = probe.Buffer.GetPosition(1L)
+                                    reader.AdvanceTo(consumed)
+                                    result <- Some(Error TooLarge)
+                            | Ok granted ->
+                                reservedBytes <- reservedBytes + granted
+                                let! readResult = reader.ReadAsync(cancellationToken)
+                                let buffer = readResult.Buffer
+                                let count = min granted buffer.Length
 
-    override _.SetLength(_: int64) = raise (NotSupportedException())
-    override _.Write(_: byte array, _: int, _: int) = raise (NotSupportedException())
+                                if count > 0L then
+                                    let data = Array.zeroCreate<byte> (int count)
+                                    let mutable copied = 0
+                                    let sequence = buffer.Slice(0L, count)
+                                    let mutable position = sequence.Start
+                                    let mutable copying = true
 
-/// A restart-scoped file store.  Content is chunked because .NET arrays cannot
-/// represent a 4 GiB file as one value.  The IFileStore boundary permits a future
-/// file-system or database implementation without changing HTTP handlers.
-type InMemoryFileStore() =
-    static let ChunkSize = 4 * 1024 * 1024
-    static let MaxFileSize = 4L * 1024L * 1024L * 1024L
-    static let MaxTotalSize = 4L * 1024L * 1024L * 1024L
+                                    while copying do
+                                        let mutable segment = ReadOnlyMemory<byte>.Empty
 
-    let syncRoot = obj ()
-    let files = Dictionary<string, StoredFile>(StringComparer.Ordinal)
-    let mutable usedBytes = 0L
+                                        if sequence.TryGet(&position, &segment, true) then
+                                            segment.Span.CopyTo(data.AsSpan(copied))
+                                            copied <- copied + segment.Length
+                                        else
+                                            copying <- false
 
-    member private _.FailForCapacity(message: string) =
-        Console.Error.WriteLine($"FATAL: {message}")
-        Environment.FailFast(message)
+                                    chunks.Add(data)
+                                    uploadedBytes <- uploadedBytes + count
 
-    member private _.FailForOutOfMemory(error: OutOfMemoryException) =
-        let message = "RAM の確保に失敗したため、ファイル共有サーバーを停止します。"
-        Console.Error.WriteLine($"FATAL: {message}{Environment.NewLine}{error}")
-        Environment.FailFast(message, error)
+                                let consumed = buffer.GetPosition(count)
+                                reader.AdvanceTo(consumed, consumed)
 
-    member private this.Reserve(bytes: int64) =
-        lock syncRoot (fun () ->
-            if bytes < 0L || usedBytes > MaxTotalSize - bytes then
-                this.FailForCapacity(
-                    $"RAM ストアの合計上限 ({MaxTotalSize} bytes) を超えるアップロードを受け取りました。"
-                )
+                                let unused = granted - count
 
-                raise (InvalidOperationException("Environment.FailFast returned unexpectedly."))
+                                if unused > 0L then
+                                    do! release handle uploadId unused
+                                    reservedBytes <- reservedBytes - unused
 
-            usedBytes <- usedBytes + bytes)
+                                if readResult.IsCompleted && count = 0L then
+                                    finished <- true
+                                elif count = 0L && not readResult.IsCompleted then
+                                    ()
 
-    member private _.Release(bytes: int64) =
-        if bytes > 0L then
-            lock syncRoot (fun () -> usedBytes <- max 0L (usedBytes - bytes))
+                    match result with
+                    | Some(Error error) ->
+                        if reservedBytes > 0L then
+                            do! release handle uploadId reservedBytes
+                            reservedBytes <- 0L
 
-    member private _.ListFiles() =
-        lock syncRoot (fun () ->
-            files.Values
-            |> Seq.map (fun file -> file.Info)
-            |> Seq.sortBy (fun file -> file.Name)
-            |> Seq.toList)
+                        return Error error
+                    | Some(Ok info) -> return Ok info
+                    | None when finished ->
+                        let info =
+                            { Id = Guid.NewGuid()
+                              Name = fileName
+                              SizeBytes = uploadedBytes
+                              UploadedAtUtc = DateTimeOffset.UtcNow }
 
-    member private _.TryOpenFile(id: Guid) =
-        lock syncRoot (fun () ->
-            files.Values
-            |> Seq.tryFind (fun file -> file.Info.Id = id)
-            |> Option.map (fun file ->
-                { Name = file.Info.Name
-                  SizeBytes = file.Info.SizeBytes
-                  OpenRead = fun () -> new ChunkedReadStream(file.Content.Chunks, file.Content.Length, ChunkSize) :> Stream }))
+                        let stored =
+                            { Info = info
+                              Content =
+                                { Chunks = chunks.ToArray()
+                                  Length = uploadedBytes } }
 
-    member private this.SaveFileAsync(fileName: string, content: Stream, cancellationToken: CancellationToken) =
-        task {
-            let chunks = ResizeArray<byte array>()
-            let mutable currentChunk: byte array = null
-            let mutable currentLength = 0
-            let mutable uploadedBytes = 0L
-            let mutable reservedBytes = 0L
-            let mutable committed = false
-            let mutable reading = true
+                        let! committed =
+                            askRequired handle cancellationToken (fun reply -> Commit(uploadId, stored, reply))
 
-            try
-                while reading do
-                    if isNull currentChunk then
-                        currentChunk <- Array.zeroCreate<byte> ChunkSize
-                        currentLength <- 0
+                        reservedBytes <- 0L
+                        return committed
+                    | None -> return Error TooLarge
+                with error ->
+                    if reservedBytes > 0L then
+                        try
+                            do! release handle uploadId reservedBytes
+                        with _ -> ()
 
-                    let! read =
-                        content
-                            .ReadAsync(currentChunk.AsMemory(currentLength, ChunkSize - currentLength), cancellationToken)
-                            .AsTask()
+                    return raise error
+            }
 
-                    if read = 0 then
-                        reading <- false
-                    else
-                        let read64 = int64 read
+            task {
+                try
+                    return! work
+                finally
+                    reader.Complete()
+            }
 
-                        if uploadedBytes > MaxFileSize - read64 then
-                            this.FailForCapacity(
-                                $"ファイル '{fileName}' が1ファイル当たりの上限 ({MaxFileSize} bytes) を超えました。"
-                            )
+    let list (handle: Handle) =
+        ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) List
 
-                            raise (InvalidOperationException("Environment.FailFast returned unexpectedly."))
+    let tryOpen (handle: Handle) id =
+        ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) (fun reply -> TryOpen(id, reply))
 
-                        this.Reserve(read64)
-                        reservedBytes <- reservedBytes + read64
-                        uploadedBytes <- uploadedBytes + read64
-                        currentLength <- currentLength + read
+    let saveAsync (handle: Handle) fileName reader cancellationToken =
+        saveCoreAsync handle fileName reader cancellationToken
 
-                        if currentLength = ChunkSize then
-                            chunks.Add(currentChunk)
-                            currentChunk <- null
-                            currentLength <- 0
-
-                if currentLength > 0 then
-                    let finalChunk = Array.zeroCreate<byte> currentLength
-                    Buffer.BlockCopy(currentChunk, 0, finalChunk, 0, currentLength)
-                    chunks.Add(finalChunk)
-
-                let info =
-                    { Id = Guid.NewGuid()
-                      Name = fileName
-                      SizeBytes = uploadedBytes
-                      UploadedAtUtc = DateTimeOffset.UtcNow }
-
-                let stored =
-                    { Info = info
-                      Content =
-                        { Chunks = chunks.ToArray()
-                          Length = uploadedBytes } }
-
-                lock syncRoot (fun () ->
-                    let found, previous = files.TryGetValue(fileName)
-                    files.[fileName] <- stored
-
-                    if found then
-                        usedBytes <- usedBytes - previous.Content.Length)
-
-                committed <- true
-                return info
-            with
-            | :? OutOfMemoryException as error ->
-                if not committed then
-                    this.Release(reservedBytes)
-
-                this.FailForOutOfMemory(error)
-                return raise (InvalidOperationException("Environment.FailFast returned unexpectedly."))
-            | error ->
-                if not committed then
-                    this.Release(reservedBytes)
-
-                return raise error
-        }
-
-    member private _.DeleteFiles(ids: Guid array) =
-        if isNull ids then
-            0
-        else
-            lock syncRoot (fun () ->
-                let selected = HashSet<Guid>(ids)
-
-                let namesToDelete =
-                    files
-                    |> Seq.choose (fun pair -> if selected.Contains(pair.Value.Info.Id) then Some pair.Key else None)
-                    |> Seq.toArray
-
-                for name in namesToDelete do
-                    let file = files.[name]
-                    files.Remove(name) |> ignore
-                    usedBytes <- usedBytes - file.Content.Length
-
-                namesToDelete.Length)
-
-    interface IFileStore with
-        member this.List() = this.ListFiles()
-        member this.TryOpen(id) = this.TryOpenFile(id)
-        member this.SaveAsync(fileName, content, cancellationToken) = this.SaveFileAsync(fileName, content, cancellationToken)
-        member this.DeleteMany(ids) = this.DeleteFiles(ids)
+    let deleteMany (handle: Handle) ids =
+        ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) (fun reply -> DeleteMany(ids, reply))

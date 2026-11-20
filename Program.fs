@@ -2,6 +2,7 @@ namespace FileShare
 
 open System
 open System.IO
+open System.IO.Pipelines
 open System.Net
 open System.Net.NetworkInformation
 open System.Net.Sockets
@@ -113,7 +114,7 @@ module private Multipart =
                 None
 
 module private EmbeddedWebRoot =
-    let private assembly = typeof<InMemoryFileStore>.Assembly
+    let private assembly = typeof<StoredFileInfo>.Assembly
     let private resourcePrefix = assembly.GetName().Name + ".wwwroot."
 
     let private contentType (path: string) =
@@ -140,7 +141,7 @@ module private EmbeddedWebRoot =
         candidates
         |> List.tryPick (fun resourcePath ->
             let resourceName = resourcePrefix + resourcePath.Replace('/', '.')
-            let stream = assembly.GetManifestResourceStream(resourceName)
+            let stream: Stream = assembly.GetManifestResourceStream(resourceName)
 
             if isNull stream then None
             else Some(stream, contentType resourcePath))
@@ -156,7 +157,7 @@ module Program =
         options.PropertyNameCaseInsensitive <- true
         options
 
-    let private uploadFiles (request: HttpRequest) (store: IFileStore) (cancellationToken: CancellationToken) =
+    let private uploadFiles (request: HttpRequest) (store: FileStore.Handle) (cancellationToken: CancellationToken) =
         task {
             match Multipart.tryGetBoundary request.ContentType with
             | None ->
@@ -166,6 +167,7 @@ module Program =
                 let uploaded = ResizeArray<StoredFileInfo>()
                 let mutable reading = true
                 let mutable validationError: string option = None
+                let mutable storeError: StoreError option = None
 
                 while reading do
                     let! section = reader.ReadNextSectionAsync(cancellationToken)
@@ -177,22 +179,32 @@ module Program =
                         | Some uploadedName ->
                             match FileName.tryNormalize uploadedName with
                             | Ok normalizedName ->
-                                let! stored = store.SaveAsync(normalizedName, section.Body, cancellationToken)
-                                uploaded.Add(stored)
+                                let reader =
+                                    PipeReader.Create(section.Body, StreamPipeReaderOptions(leaveOpen = true))
+
+                                let! stored = FileStore.saveAsync store normalizedName reader cancellationToken
+
+                                match stored with
+                                | Ok info -> uploaded.Add(info)
+                                | Error error ->
+                                    storeError <- Some error
+                                    reading <- false
                             | Error message ->
                                 validationError <- Some message
                                 do! section.Body.CopyToAsync(Stream.Null, cancellationToken)
                         | None ->
                             do! section.Body.CopyToAsync(Stream.Null, cancellationToken)
 
-                match validationError with
-                | Some message -> return Results.BadRequest(message)
-                | None when uploaded.Count = 0 ->
+                match storeError, validationError with
+                | Some StoreError.Busy, _ -> return Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
+                | Some StoreError.TooLarge, _ -> return Results.StatusCode(StatusCodes.Status413PayloadTooLarge)
+                | None, Some message -> return Results.BadRequest(message)
+                | None, None when uploaded.Count = 0 ->
                     return Results.BadRequest("アップロードするファイルを指定してください。")
-                | None -> return Results.Ok(uploaded.ToArray())
+                | None, None -> return Results.Ok(uploaded.ToArray())
         }
 
-    let private deleteFiles (request: HttpRequest) (store: IFileStore) (cancellationToken: CancellationToken) =
+    let private deleteFiles (request: HttpRequest) (store: FileStore.Handle) (cancellationToken: CancellationToken) =
         task {
             try
                 let! payload =
@@ -201,8 +213,12 @@ module Program =
                 if isNull (box payload) || isNull payload.Ids then
                     return Results.BadRequest("ids 配列を指定してください。")
                 else
-                    let deleted = store.DeleteMany(payload.Ids)
-                    return Results.Ok({ Deleted = deleted })
+                    let! deleted = FileStore.deleteMany store payload.Ids
+
+                    match deleted with
+                    | Ok count -> return Results.Ok({ Deleted = count })
+                    | Error StoreError.Busy -> return Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
+                    | Error StoreError.TooLarge -> return Results.StatusCode(StatusCodes.Status413PayloadTooLarge)
             with :? JsonException ->
                 return Results.BadRequest("削除対象のJSON形式が正しくありません。")
         }
@@ -224,35 +240,54 @@ module Program =
                 options.Listen(settings.Address, settings.Port))
             |> ignore
 
-            builder.Services.AddSingleton<IFileStore>(InMemoryFileStore() :> IFileStore) |> ignore
+            let store = FileStore.createHandle ()
+            FileStore.start store |> ignore
+            builder.Services.AddSingleton<FileStore.Handle>(store) |> ignore
 
             let app = builder.Build()
             app.MapGet("/swagger", Func<IResult>(fun () -> Results.Redirect("/docs/"))) |> ignore
 
             app.MapGet(
                 "/api/files",
-                Func<IFileStore, IResult>(fun store -> Results.Ok(store.List()))
+                Func<FileStore.Handle, Task<IResult>>(fun store ->
+                    task {
+                        let! files = FileStore.list store
+
+                        match files with
+                        | Ok result -> return Results.Ok(result)
+                        | Error StoreError.Busy -> return Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
+                        | Error StoreError.TooLarge -> return Results.StatusCode(StatusCodes.Status413PayloadTooLarge)
+                    })
             )
             |> ignore
 
             app.MapPost(
                 "/api/files",
-                Func<HttpRequest, IFileStore, CancellationToken, Task<IResult>>(uploadFiles)
+                Func<HttpRequest, FileStore.Handle, CancellationToken, Task<IResult>>(uploadFiles)
             )
             |> ignore
 
             app.MapDelete(
                 "/api/files",
-                Func<HttpRequest, IFileStore, CancellationToken, Task<IResult>>(deleteFiles)
+                Func<HttpRequest, FileStore.Handle, CancellationToken, Task<IResult>>(deleteFiles)
             )
             |> ignore
 
             app.MapGet(
                 "/api/files/{id:guid}/download",
-                Func<Guid, IFileStore, IResult>(fun id store ->
-                    match store.TryOpen(id) with
-                    | Some file -> Results.File(file.OpenRead(), "application/octet-stream", file.Name)
-                    | None -> Results.NotFound())
+                Func<Guid, FileStore.Handle, HttpContext, Task<IResult>>(fun id store context ->
+                    task {
+                        let! found = FileStore.tryOpen store id
+
+                        match found with
+                        | Ok(Some file) ->
+                            let stream = FileDownload.toStream file context.RequestAborted
+                            context.Response.ContentLength <- Nullable file.SizeBytes
+                            return Results.Stream(stream, "application/octet-stream", file.Name)
+                        | Ok None -> return Results.NotFound()
+                        | Error StoreError.Busy -> return Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
+                        | Error StoreError.TooLarge -> return Results.StatusCode(StatusCodes.Status413PayloadTooLarge)
+                    })
             )
             |> ignore
 
