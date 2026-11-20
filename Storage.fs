@@ -9,11 +9,12 @@ open System.Threading.Channels
 open System.Threading.Tasks
 
 [<CLIMutable>]
-type StoredFileInfo =
-    { Id: Guid
-      Name: string
-      SizeBytes: int64
-      UploadedAtUtc: DateTimeOffset }
+type StoredFileInfo = {
+    Id: Guid
+    Name: string
+    SizeBytes: int64
+    UploadedAtUtc: DateTimeOffset
+}
 
 [<CLIMutable>]
 type DeleteResponse = { Deleted: int }
@@ -25,15 +26,21 @@ type StoreError =
     | Busy
     | TooLarge
 
-type private ChunkedContent =
-    { Chunks: byte array array
-      Length: int64 }
+type private ChunkedContent = {
+    Chunks: byte array array
+    Length: int64
+}
 
-type private StoredFile =
-    { Info: StoredFileInfo
-      Content: ChunkedContent }
+type private StoredFile = {
+    Info: StoredFileInfo
+    Content: ChunkedContent
+}
 
-type FileDownload = private { Name: string; SizeBytes: int64; Content: ChunkedContent }
+type FileDownload = private {
+    Name: string
+    SizeBytes: int64
+    Content: ChunkedContent
+}
 
 module FileDownload =
     let private copyToPipe (content: ChunkedContent) (writer: PipeWriter) (cancellationToken: CancellationToken) =
@@ -57,7 +64,8 @@ module FileDownload =
             with error ->
                 try
                     do! writer.CompleteAsync(error)
-                with _ -> ()
+                with _ ->
+                    ()
         }
 
     /// Creates a Stream adapter over a bounded pipeline. The producer task owns
@@ -77,18 +85,20 @@ module FileDownload =
         copyToPipe file.Content pipe.Writer cancellationToken |> ignore
         pipe.Reader.AsStream()
 
-type private State =
-    { Files: Map<string, StoredFile>
-      UsedBytes: int64
-      ReservedBytes: int64
-      Reservations: Map<Guid, int64> }
+type private State = {
+    Files: Map<string, StoredFile>
+    UsedBytes: int64
+    ReservedBytes: int64
+    Reservations: Map<Guid, int64>
+}
 
 module private State =
-    let empty =
-        { Files = Map.empty
-          UsedBytes = 0L
-          ReservedBytes = 0L
-          Reservations = Map.empty }
+    let empty = {
+        Files = Map.empty
+        UsedBytes = 0L
+        ReservedBytes = 0L
+        Reservations = Map.empty
+    }
 
     let list state =
         state.Files
@@ -102,15 +112,18 @@ module private State =
         |> Map.toSeq
         |> Seq.tryPick (fun (_, file) ->
             if file.Info.Id = id then
-                Some
-                    { Name = file.Info.Name
-                      SizeBytes = file.Info.SizeBytes
-                      Content = file.Content }
+                Some {
+                    Name = file.Info.Name
+                    SizeBytes = file.Info.SizeBytes
+                    Content = file.Content
+                }
             else
                 None)
 
     let reserve uploadId requestedBytes state =
-        let available = max 0L (4L * 1024L * 1024L * 1024L - state.UsedBytes - state.ReservedBytes)
+        let available =
+            max 0L (4L * 1024L * 1024L * 1024L - state.UsedBytes - state.ReservedBytes)
+
         let granted = min requestedBytes available
 
         if granted <= 0L then
@@ -118,9 +131,11 @@ module private State =
         else
             let previous = state.Reservations |> Map.tryFind uploadId |> Option.defaultValue 0L
 
-            { state with
-                ReservedBytes = state.ReservedBytes + granted
-                Reservations = Map.add uploadId (previous + granted) state.Reservations },
+            {
+                state with
+                    ReservedBytes = state.ReservedBytes + granted
+                    Reservations = Map.add uploadId (previous + granted) state.Reservations
+            },
             granted
 
     let release uploadId bytes state =
@@ -128,25 +143,32 @@ module private State =
         let released = min previous (max 0L bytes)
         let remaining = previous - released
 
-        { state with
-            ReservedBytes = max 0L (state.ReservedBytes - released)
-            Reservations =
-                if remaining = 0L then Map.remove uploadId state.Reservations
-                else Map.add uploadId remaining state.Reservations }
+        {
+            state with
+                ReservedBytes = max 0L (state.ReservedBytes - released)
+                Reservations =
+                    if remaining = 0L then
+                        Map.remove uploadId state.Reservations
+                    else
+                        Map.add uploadId remaining state.Reservations
+        }
 
     let commit uploadId file state =
         let reserved = state.Reservations |> Map.tryFind uploadId |> Option.defaultValue 0L
+
         let previousSize =
             state.Files
             |> Map.tryFind file.Info.Name
             |> Option.map (fun previous -> previous.Content.Length)
             |> Option.defaultValue 0L
 
-        { state with
-            Files = Map.add file.Info.Name file state.Files
-            UsedBytes = state.UsedBytes - previousSize + file.Content.Length
-            ReservedBytes = max 0L (state.ReservedBytes - reserved)
-            Reservations = Map.remove uploadId state.Reservations }
+        {
+            state with
+                Files = Map.add file.Info.Name file state.Files
+                UsedBytes = state.UsedBytes - previousSize + file.Content.Length
+                ReservedBytes = max 0L (state.ReservedBytes - reserved)
+                Reservations = Map.remove uploadId state.Reservations
+        }
 
     let deleteMany (ids: Guid array) (state: State) =
         if isNull ids then
@@ -155,19 +177,18 @@ module private State =
             let selected = HashSet<Guid>(ids)
 
             let remaining =
-                state.Files
-                |> Map.filter (fun _ file -> not (selected.Contains(file.Info.Id)))
+                state.Files |> Map.filter (fun _ file -> not (selected.Contains(file.Info.Id)))
 
             let deleted = state.Files.Count - remaining.Count
 
             let usedBytes =
-                remaining
-                |> Map.toSeq
-                |> Seq.sumBy (fun (_, file) -> file.Content.Length)
+                remaining |> Map.toSeq |> Seq.sumBy (fun (_, file) -> file.Content.Length)
 
-            { state with
-                Files = remaining
-                UsedBytes = usedBytes },
+            {
+                state with
+                    Files = remaining
+                    UsedBytes = usedBytes
+            },
             deleted
 
 module FileName =
@@ -205,12 +226,16 @@ module FileStore =
 
     let createHandle () =
         let options =
-            BoundedChannelOptions(127,
+            BoundedChannelOptions(
+                127,
                 SingleReader = true,
                 SingleWriter = false,
-                FullMode = BoundedChannelFullMode.Wait)
+                FullMode = BoundedChannelFullMode.Wait
+            )
 
-        { Channel = Channel.CreateBounded<Message>(options) }
+        {
+            Channel = Channel.CreateBounded<Message>(options)
+        }
 
     let start (handle: Handle) =
         let rec run state =
@@ -221,22 +246,22 @@ module FileStore =
                 | List reply ->
                     reply.TrySetResult(Ok(State.list state)) |> ignore
                     return! run state
-                | TryOpen (id, reply) ->
+                | TryOpen(id, reply) ->
                     reply.TrySetResult(Ok(State.tryOpen id state)) |> ignore
                     return! run state
-                | Reserve (uploadId, requested, reply) ->
+                | Reserve(uploadId, requested, reply) ->
                     let nextState, granted = State.reserve uploadId requested state
                     reply.TrySetResult(Ok granted) |> ignore
                     return! run nextState
-                | Release (uploadId, bytes, reply) ->
+                | Release(uploadId, bytes, reply) ->
                     let nextState = State.release uploadId bytes state
                     reply.TrySetResult(()) |> ignore
                     return! run nextState
-                | Commit (uploadId, stored, reply) ->
+                | Commit(uploadId, stored, reply) ->
                     let nextState = State.commit uploadId stored state
                     reply.TrySetResult(Ok stored.Info) |> ignore
                     return! run nextState
-                | DeleteMany (ids, reply) ->
+                | DeleteMany(ids, reply) ->
                     let nextState, deleted = State.deleteMany ids state
                     reply.TrySetResult(Ok deleted) |> ignore
                     return! run nextState
@@ -245,31 +270,38 @@ module FileStore =
         run State.empty
 
     let private ask (handle: Handle) tryWrite createMessage =
-            task {
-                let reply = newReply ()
-                let message = createMessage reply
+        task {
+            let reply = newReply ()
+            let message = createMessage reply
 
-                if not (tryWrite message) then
-                    return Error Busy
-                else
-                    return! reply.Task
-            }
+            if not (tryWrite message) then
+                return Error Busy
+            else
+                return! reply.Task
+        }
 
     let private askRequired (handle: Handle) (cancellationToken: CancellationToken) createMessage =
-            task {
-                let reply = newReply ()
-                do! handle.Channel.Writer.WriteAsync(createMessage reply, cancellationToken)
-                return! reply.Task
-            }
+        task {
+            let reply = newReply ()
+            do! handle.Channel.Writer.WriteAsync(createMessage reply, cancellationToken)
+            return! reply.Task
+        }
 
     let private reserve (handle: Handle) uploadId requested =
-        ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) (fun reply -> Reserve(uploadId, requested, reply))
+        ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) (fun reply ->
+            Reserve(uploadId, requested, reply))
 
     let private release (handle: Handle) uploadId bytes =
         askRequired handle CancellationToken.None (fun reply -> Release(uploadId, bytes, reply))
 
-    let private saveCoreAsync (handle: Handle) (fileName: string) (reader: PipeReader) (cancellationToken: CancellationToken) =
-            let work = task {
+    let private saveCoreAsync
+        (handle: Handle)
+        (fileName: string)
+        (reader: PipeReader)
+        (cancellationToken: CancellationToken)
+        =
+        let work =
+            task {
                 let uploadId = Guid.NewGuid()
                 let chunks = ResizeArray<byte array>()
                 let mutable uploadedBytes = 0L
@@ -361,17 +393,20 @@ module FileStore =
                         return Error error
                     | Some(Ok info) -> return Ok info
                     | None when finished ->
-                        let info =
-                            { Id = Guid.NewGuid()
-                              Name = fileName
-                              SizeBytes = uploadedBytes
-                              UploadedAtUtc = DateTimeOffset.UtcNow }
+                        let info = {
+                            Id = Guid.NewGuid()
+                            Name = fileName
+                            SizeBytes = uploadedBytes
+                            UploadedAtUtc = DateTimeOffset.UtcNow
+                        }
 
-                        let stored =
-                            { Info = info
-                              Content =
-                                { Chunks = chunks.ToArray()
-                                  Length = uploadedBytes } }
+                        let stored = {
+                            Info = info
+                            Content = {
+                                Chunks = chunks.ToArray()
+                                Length = uploadedBytes
+                            }
+                        }
 
                         let! committed =
                             askRequired handle cancellationToken (fun reply -> Commit(uploadId, stored, reply))
@@ -383,17 +418,18 @@ module FileStore =
                     if reservedBytes > 0L then
                         try
                             do! release handle uploadId reservedBytes
-                        with _ -> ()
+                        with _ ->
+                            ()
 
                     return raise error
             }
 
-            task {
-                try
-                    return! work
-                finally
-                    reader.Complete()
-            }
+        task {
+            try
+                return! work
+            finally
+                reader.Complete()
+        }
 
     let list (handle: Handle) =
         ask handle (fun message -> handle.Channel.Writer.TryWrite(message)) List

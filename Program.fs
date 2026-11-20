@@ -12,15 +12,12 @@ open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.Hosting
-open Microsoft.AspNetCore.Server.Kestrel.Core
 open Microsoft.AspNetCore.WebUtilities
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Microsoft.Net.Http.Headers
 
-type ServerOptions =
-    { Address: IPAddress
-      Port: int }
+type ServerOptions = { Address: IPAddress; Port: int }
 
 module private CommandLine =
     let usage = "Usage: FileShareServer --ip <IPv4-or-IPv6-address> --port <1-65535>"
@@ -30,7 +27,11 @@ module private CommandLine =
             match remaining with
             | [] ->
                 match address, port with
-                | Some parsedAddress, Some parsedPort -> Ok { Address = parsedAddress; Port = parsedPort }
+                | Some parsedAddress, Some parsedPort ->
+                    Ok {
+                        Address = parsedAddress
+                        Port = parsedPort
+                    }
                 | _ -> Error $"--ip と --port は必須です。{Environment.NewLine}{usage}"
             | "--ip" :: value :: tail ->
                 match address, IPAddress.TryParse(value) with
@@ -68,9 +69,11 @@ module private Url =
 
     let displayAddress configuredAddress =
         if configuredAddress.Equals(IPAddress.Any) then
-            firstUsableAddress AddressFamily.InterNetwork |> Option.defaultValue IPAddress.Loopback
+            firstUsableAddress AddressFamily.InterNetwork
+            |> Option.defaultValue IPAddress.Loopback
         elif configuredAddress.Equals(IPAddress.IPv6Any) then
-            firstUsableAddress AddressFamily.InterNetworkV6 |> Option.defaultValue IPAddress.IPv6Loopback
+            firstUsableAddress AddressFamily.InterNetworkV6
+            |> Option.defaultValue IPAddress.IPv6Loopback
         else
             configuredAddress
 
@@ -82,7 +85,15 @@ module private Multipart =
             try
                 let mediaType = MediaTypeHeaderValue.Parse(contentType)
 
-                if not (String.Equals(mediaType.MediaType.Value, "multipart/form-data", StringComparison.OrdinalIgnoreCase)) then
+                if
+                    not (
+                        String.Equals(
+                            mediaType.MediaType.Value,
+                            "multipart/form-data",
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                    )
+                then
                     None
                 else
                     let boundary = HeaderUtilities.RemoveQuotes(mediaType.Boundary).Value
@@ -101,15 +112,26 @@ module private Multipart =
             try
                 let disposition = ContentDispositionHeaderValue.Parse(section.ContentDisposition)
 
-                if not (String.Equals(disposition.DispositionType.Value, "form-data", StringComparison.OrdinalIgnoreCase)) then
+                if
+                    not (
+                        String.Equals(
+                            disposition.DispositionType.Value,
+                            "form-data",
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                    )
+                then
                     None
                 else
                     let starName = HeaderUtilities.RemoveQuotes(disposition.FileNameStar).Value
                     let normalName = HeaderUtilities.RemoveQuotes(disposition.FileName).Value
 
-                    if not (String.IsNullOrWhiteSpace starName) then Some starName
-                    elif not (String.IsNullOrWhiteSpace normalName) then Some normalName
-                    else None
+                    if not (String.IsNullOrWhiteSpace starName) then
+                        Some starName
+                    elif not (String.IsNullOrWhiteSpace normalName) then
+                        Some normalName
+                    else
+                        None
             with :? FormatException ->
                 None
 
@@ -127,8 +149,10 @@ module private EmbeddedWebRoot =
 
     let tryOpen (requestPath: string) =
         let normalizedPath =
-            if String.IsNullOrWhiteSpace requestPath then ""
-            else requestPath.Trim('/')
+            if String.IsNullOrWhiteSpace requestPath then
+                ""
+            else
+                requestPath.Trim('/')
 
         let candidates =
             if String.IsNullOrEmpty normalizedPath then
@@ -143,8 +167,10 @@ module private EmbeddedWebRoot =
             let resourceName = resourcePrefix + resourcePath.Replace('/', '.')
             let stream: Stream = assembly.GetManifestResourceStream(resourceName)
 
-            if isNull stream then None
-            else Some(stream, contentType resourcePath))
+            if isNull stream then
+                None
+            else
+                Some(stream, contentType resourcePath))
 
 module Program =
     let private serveEmbeddedResource requestPath : IResult =
@@ -160,8 +186,7 @@ module Program =
     let private uploadFiles (request: HttpRequest) (store: FileStore.Handle) (cancellationToken: CancellationToken) =
         task {
             match Multipart.tryGetBoundary request.ContentType with
-            | None ->
-                return Results.BadRequest("multipart/form-data 形式でファイルを送信してください。")
+            | None -> return Results.BadRequest("multipart/form-data 形式でファイルを送信してください。")
             | Some boundary ->
                 let reader = MultipartReader(boundary, request.Body)
                 let uploaded = ResizeArray<StoredFileInfo>()
@@ -192,15 +217,13 @@ module Program =
                             | Error message ->
                                 validationError <- Some message
                                 do! section.Body.CopyToAsync(Stream.Null, cancellationToken)
-                        | None ->
-                            do! section.Body.CopyToAsync(Stream.Null, cancellationToken)
+                        | None -> do! section.Body.CopyToAsync(Stream.Null, cancellationToken)
 
                 match storeError, validationError with
                 | Some StoreError.Busy, _ -> return Results.StatusCode(StatusCodes.Status503ServiceUnavailable)
                 | Some StoreError.TooLarge, _ -> return Results.StatusCode(StatusCodes.Status413PayloadTooLarge)
                 | None, Some message -> return Results.BadRequest(message)
-                | None, None when uploaded.Count = 0 ->
-                    return Results.BadRequest("アップロードするファイルを指定してください。")
+                | None, None when uploaded.Count = 0 -> return Results.BadRequest("アップロードするファイルを指定してください。")
                 | None, None -> return Results.Ok(uploaded.ToArray())
         }
 
@@ -208,7 +231,9 @@ module Program =
         task {
             try
                 let! payload =
-                    JsonSerializer.DeserializeAsync<DeleteRequest>(request.Body, requestJsonOptions, cancellationToken).AsTask()
+                    JsonSerializer
+                        .DeserializeAsync<DeleteRequest>(request.Body, requestJsonOptions, cancellationToken)
+                        .AsTask()
 
                 if isNull (box payload) || isNull payload.Ids then
                     return Results.BadRequest("ids 配列を指定してください。")
@@ -231,7 +256,9 @@ module Program =
             2
         | Ok settings ->
             let builder = WebApplication.CreateBuilder()
-            builder.Logging.AddFilter("Microsoft.Hosting.Lifetime", LogLevel.Warning) |> ignore
+
+            builder.Logging.AddFilter("Microsoft.Hosting.Lifetime", LogLevel.Warning)
+            |> ignore
 
             builder.WebHost.ConfigureKestrel(fun options ->
                 // The logical 4 GiB limit is enforced by InMemoryFileStore while streaming.
@@ -245,7 +272,9 @@ module Program =
             builder.Services.AddSingleton<FileStore.Handle>(store) |> ignore
 
             let app = builder.Build()
-            app.MapGet("/swagger", Func<IResult>(fun () -> Results.Redirect("/docs/"))) |> ignore
+
+            app.MapGet("/swagger", Func<IResult>(fun () -> Results.Redirect("/docs/")))
+            |> ignore
 
             app.MapGet(
                 "/api/files",
@@ -292,16 +321,13 @@ module Program =
             |> ignore
 
             app.MapGet("/", Func<IResult>(fun () -> serveEmbeddedResource "")) |> ignore
-            app.MapGet(
-                "/{**path}",
-                Func<HttpRequest, IResult>(fun request -> serveEmbeddedResource request.Path.Value)
-            )
+
+            app.MapGet("/{**path}", Func<HttpRequest, IResult>(fun request -> serveEmbeddedResource request.Path.Value))
             |> ignore
 
             let indexUrl = Url.format (Url.displayAddress settings.Address) settings.Port
 
-            app.Lifetime.ApplicationStarted.Register(fun () ->
-                Console.WriteLine($"Index URL: {indexUrl}"))
+            app.Lifetime.ApplicationStarted.Register(fun () -> Console.WriteLine($"Index URL: {indexUrl}"))
             |> ignore
 
             app.Run()
